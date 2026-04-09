@@ -1,0 +1,14 @@
+fastapi==0.111.*
+uvicorn==0.30.*
+pydantic==2.7.*
+numpy==1.26.*
+opencv-python-headless==4.10.*
+insightface==0.7.3
+onnxruntime-gpu==1.18.*
+torch==2.3.0
+torchvision==0.18.0
+albumentations
+matplotlib
+pycocotools
+# Note: SAM 3.1 (Segment Anything 2) is typically installed via git or source, 
+# but for cloud deployment we require the base torch modules setup first.
