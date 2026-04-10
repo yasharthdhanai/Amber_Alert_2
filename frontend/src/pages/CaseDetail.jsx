@@ -128,7 +128,7 @@ export default function CaseDetail() {
         
         <div className="relative">
           <div className="w-32 h-32 md:w-48 md:h-48 rounded-2xl overflow-hidden border-2 border-white/10 shadow-2xl z-10 bg-slate-900">
-            <img src={getCasePhotoUrl(caseData.id)} alt={caseData.child_name} className="w-full h-full object-cover" />
+            <img src={caseData.reference_photo || getCasePhotoUrl(caseData.id)} alt={caseData.child_name} className="w-full h-full object-cover" />
           </div>
           <div className="absolute -bottom-3 -right-3 bg-emerald-500 p-2 rounded-xl shadow-lg border border-emerald-400">
             <UserCheck className="w-6 h-6 text-slate-900" />
@@ -238,7 +238,7 @@ export default function CaseDetail() {
                     <div className="relative rounded-xl overflow-hidden aspect-video bg-black/50 border border-white/5 flex items-center justify-center group-hover:border-emerald-500/30">
                       
                       <img 
-                        src={getMatchScreenshotUrl(caseId, m.id)} 
+                        src={m.screenshot_path || getMatchScreenshotUrl(caseId, m.id)} 
                         alt="Match Snapshot"
                         className="w-full h-full object-contain"
                         onError={(e) => { e.target.style.display = 'none'; }}

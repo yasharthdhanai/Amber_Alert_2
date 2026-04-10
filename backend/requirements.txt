@@ -2,5 +2,8 @@ fastapi==0.111.*
 uvicorn==0.30.*
 celery==5.3.*
 redis==5.0.*
-aiosqlite==0.20.*
 pydantic==2.7.*
+supabase==2.4.*
+python-dotenv==1.0.*
+requests
+opencv-python-headless

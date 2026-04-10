@@ -4,18 +4,13 @@ import requests
 import cv2
 import base64
 import uuid
-import sqlite3
 import time
 from datetime import datetime
 from .video_utils import get_video_rotation, extract_and_normalize_frame
+from .database import supabase
 
 redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 ml_service_url = os.environ.get("ML_SERVICE_URL", "http://localhost:8050")
-
-STORAGE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "storage")
-DB_PATH = os.path.join(STORAGE_DIR, "mcf.db")
-SCREENSHOTS_DIR = os.path.join(STORAGE_DIR, "screenshots")
-os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
 
 celery_app = Celery(
     "mcf_tasks",
@@ -32,25 +27,30 @@ celery_app.conf.update(
 )
 
 
-def _get_sync_db():
-    """Get a synchronous SQLite connection for use inside Celery tasks."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
-
-
-def _save_screenshot(frame, case_id: str, frame_idx: int, bbox: list) -> str:
-    """Draw bounding box on frame and save as screenshot. Returns file path."""
+def _upload_screenshot(frame, case_id: str, frame_idx: int, bbox: list) -> str:
+    """Draw bounding box on frame and save buffer directly to Supabase Storage."""
     screenshot = frame.copy()
     x1, y1, x2, y2 = [int(c) for c in bbox]
     cv2.rectangle(screenshot, (x1, y1), (x2, y2), (0, 255, 0), 3)
     cv2.putText(screenshot, "MATCH", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
     
     filename = f"{case_id}_frame{frame_idx}_{uuid.uuid4().hex[:8]}.jpg"
-    filepath = os.path.join(SCREENSHOTS_DIR, filename)
-    cv2.imwrite(filepath, screenshot)
-    return filepath
+    
+    # Encode to memory buffer
+    _, buffer = cv2.imencode('.jpg', screenshot)
+    image_bytes = buffer.tobytes()
+    
+    try:
+        supabase.storage.from_("screenshots").upload(
+            filename,
+            image_bytes,
+            {"content-type": "image/jpeg"}
+        )
+    except Exception as e:
+        print(f"Failed to upload screenshot to cloud: {e}")
+        return ""
+        
+    return supabase.storage.from_("screenshots").get_public_url(filename)
 
 
 def _format_timestamp(seconds: float) -> str:
@@ -61,46 +61,46 @@ def _format_timestamp(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+def _fetch_case_matches_count(case_id: str) -> int:
+    try:
+        resp = supabase.table("cases").select("total_matches").eq("id", case_id).execute()
+        return resp.data[0]["total_matches"] if resp.data else 0
+    except:
+        return 0
+
+
+def _fetch_case_videos_analyzed(case_id: str) -> int:
+    try:
+        resp = supabase.table("cases").select("videos_analyzed").eq("id", case_id).execute()
+        return resp.data[0]["videos_analyzed"] if resp.data else 0
+    except:
+        return 0
+
+
 @celery_app.task(bind=True, max_retries=3)
 def scan_video_task(self, case_id: str, video_path: str, reference_embedding: list, job_id: str = None):
     """
     Slices the video using OpenCV, sends frames to the ML engine,
-    and persists all matches to SQLite with annotated screenshots.
+    and persists all matches to Supabase cloud.
     """
-    db = _get_sync_db()
-    
     try:
-        # Mark job as running
         if job_id:
-            db.execute(
-                "UPDATE jobs SET status = ?, started_at = ? WHERE id = ?",
-                ("running", datetime.utcnow().isoformat(), job_id)
-            )
-            db.commit()
+            supabase.table("jobs").update({"status": "running", "started_at": datetime.utcnow().isoformat()}).eq("id", job_id).execute()
         
         rotation = get_video_rotation(video_path)
         cap = cv2.VideoCapture(video_path)
         
         if not cap.isOpened():
             if job_id:
-                db.execute(
-                    "UPDATE jobs SET status = ?, error_message = ? WHERE id = ?",
-                    ("failed", "Could not open video file", job_id)
-                )
-                db.commit()
+                supabase.table("jobs").update({"status": "failed", "error_message": "Could not open video file locally"}).eq("id", job_id).execute()
             return {"status": "failed", "case_id": case_id, "error": "Could not open video file"}
         
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        frame_interval = max(1, int(fps))  # Process ~1 frame per second
+        frame_interval = max(1, int(fps))
         
-        # Update job with total frame count
         if job_id:
-            db.execute(
-                "UPDATE jobs SET frames_total = ? WHERE id = ?",
-                (total_frames // frame_interval, job_id)
-            )
-            db.commit()
+            supabase.table("jobs").update({"frames_total": total_frames // frame_interval}).eq("id", job_id).execute()
         
         matches_found = 0
         frames_processed = 0
@@ -112,11 +112,9 @@ def scan_video_task(self, case_id: str, video_path: str, reference_embedding: li
                 break
                 
             if frame_idx % frame_interval == 0:
-                # Convert frame to Base64 for the ML HTTP REST Service
                 _, buffer = cv2.imencode('.jpg', frame)
                 frame_b64 = base64.b64encode(buffer).decode('utf-8')
                 
-                # Send to GPU ML Engine
                 try:
                     response = requests.post(f"{ml_service_url}/analyze", json={
                         "frame_b64": frame_b64,
@@ -133,64 +131,67 @@ def scan_video_task(self, case_id: str, video_path: str, reference_embedding: li
                             bbox = match["bbox"]
                             timestamp_sec = frame_idx / fps
                             
-                            # Save annotated screenshot
-                            screenshot_path = _save_screenshot(
+                            # Upload to Cloud Bucket
+                            screenshot_url = _upload_screenshot(
                                 frame, case_id, frame_idx, bbox
                             )
                             
-                            # Insert match record into SQLite
                             match_id = str(uuid.uuid4())
-                            db.execute(
-                                """INSERT INTO matches 
-                                   (id, case_id, video_source, source_type, timestamp_seconds,
-                                    timestamp_display, frame_number, confidence_score,
-                                    bbox_x1, bbox_y1, bbox_x2, bbox_y2, screenshot_local)
-                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                                (match_id, case_id, os.path.basename(video_path), "upload",
-                                 timestamp_sec, _format_timestamp(timestamp_sec), frame_idx,
-                                 confidence, bbox[0], bbox[1], bbox[2], bbox[3],
-                                 screenshot_path)
-                            )
-                            db.commit()
+                            match_data = {
+                                "id": match_id,
+                                "case_id": case_id,
+                                "video_source": os.path.basename(video_path),
+                                "source_type": "upload",
+                                "timestamp_seconds": timestamp_sec,
+                                "timestamp_display": _format_timestamp(timestamp_sec),
+                                "frame_number": frame_idx,
+                                "confidence_score": confidence,
+                                "bbox_x1": bbox[0],
+                                "bbox_y1": bbox[1],
+                                "bbox_x2": bbox[2],
+                                "bbox_y2": bbox[3],
+                                "screenshot_cloud": screenshot_url
+                            }
+                            supabase.table("matches").insert(match_data).execute()
                 
                 except requests.exceptions.RequestException as e:
                     print(f"ML service request failed at frame {frame_idx}: {e}")
-                    # Continue processing — don't abort the entire video for one frame failure
                 
                 frames_processed += 1
                 
-                # Update job progress every 10 frames
                 if job_id and frames_processed % 10 == 0:
                     progress = min(99, int((frame_idx / max(total_frames, 1)) * 100))
-                    db.execute(
-                        "UPDATE jobs SET progress_pct = ?, frames_done = ? WHERE id = ?",
-                        (progress, frames_processed, job_id)
-                    )
-                    db.commit()
+                    supabase.table("jobs").update({
+                        "progress_pct": progress, 
+                        "frames_done": frames_processed
+                    }).eq("id", job_id).execute()
                     
             frame_idx += 1
             
         cap.release()
         
-        # Update case with match count and video count
-        db.execute(
-            """UPDATE cases SET 
-               total_matches = total_matches + ?,
-               videos_analyzed = videos_analyzed + 1,
-               updated_at = datetime('now')
-               WHERE id = ?""",
-            (matches_found, case_id)
-        )
+        # Update case with match count and video count via direct fetch & update (since PostgREST lacks direct increment easily from SDK)
+        current_matches = _fetch_case_matches_count(case_id)
+        current_videos = _fetch_case_videos_analyzed(case_id)
         
-        # Mark job as completed
+        supabase.table("cases").update({
+            "total_matches": current_matches + matches_found,
+            "videos_analyzed": current_videos + 1,
+            "updated_at": datetime.utcnow().isoformat()
+        }).eq("id", case_id).execute()
+        
         if job_id:
-            db.execute(
-                """UPDATE jobs SET status = ?, progress_pct = 100, 
-                   frames_done = ?, completed_at = ? WHERE id = ?""",
-                ("completed", frames_processed, datetime.utcnow().isoformat(), job_id)
-            )
+            supabase.table("jobs").update({
+                "status": "completed", 
+                "progress_pct": 100, 
+                "frames_done": frames_processed, 
+                "completed_at": datetime.utcnow().isoformat()
+            }).eq("id", job_id).execute()
         
-        db.commit()
+        # Clean up the localized copy that OpenCV used
+        try: os.remove(video_path)
+        except: pass
+
         return {
             "status": "completed",
             "case_id": case_id,
@@ -199,63 +200,43 @@ def scan_video_task(self, case_id: str, video_path: str, reference_embedding: li
         }
         
     except requests.exceptions.RequestException as e:
-        # Retry the task if the ML service drops connection catastrophically
         if job_id:
-            db.execute(
-                "UPDATE jobs SET status = ?, error_message = ? WHERE id = ?",
-                ("retrying", str(e), job_id)
-            )
-            db.commit()
+            supabase.table("jobs").update({"status": "retrying", "error_message": str(e)}).eq("id", job_id).execute()
         self.retry(exc=e, countdown=10)
         
     except Exception as e:
         if job_id:
-            db.execute(
-                "UPDATE jobs SET status = ?, error_message = ? WHERE id = ?",
-                ("failed", str(e), job_id)
-            )
-            db.commit()
+            supabase.table("jobs").update({"status": "failed", "error_message": str(e)}).eq("id", job_id).execute()
         raise
-        
-    finally:
-        db.close()
 
 
 @celery_app.task(bind=True, max_retries=3)
 def monitor_rtsp_task(self, case_id: str, rtsp_url: str, reference_embedding: list, job_id: str = None):
     """
     Connects to an RTSP stream and continuously analyzes frames
-    for face matches against the reference embedding.
+    for face matches against the reference embedding, pushing to Supabase.
     """
-    db = _get_sync_db()
-    
     try:
         if job_id:
-            db.execute(
-                "UPDATE jobs SET status = ?, started_at = ? WHERE id = ?",
-                ("running", datetime.utcnow().isoformat(), job_id)
-            )
-            db.commit()
+            supabase.table("jobs").update({"status": "running", "started_at": datetime.utcnow().isoformat()}).eq("id", job_id).execute()
         
         cap = cv2.VideoCapture(rtsp_url)
         if not cap.isOpened():
             if job_id:
-                db.execute(
-                    "UPDATE jobs SET status = ?, error_message = ? WHERE id = ?",
-                    ("failed", f"Could not connect to RTSP stream: {rtsp_url}", job_id)
-                )
-                db.commit()
+                supabase.table("jobs").update({
+                    "status": "failed", 
+                    "error_message": f"Could not connect to RTSP stream: {rtsp_url}"
+                }).eq("id", job_id).execute()
             return {"status": "failed", "case_id": case_id, "error": "Could not connect to RTSP stream"}
         
         frame_idx = 0
         matches_found = 0
         fps = cap.get(cv2.CAP_PROP_FPS) or 15
-        frame_interval = max(1, int(fps))  # ~1 frame per second
+        frame_interval = max(1, int(fps))
         
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
-                # Stream may have ended or disconnected
                 time.sleep(2)
                 cap.release()
                 cap = cv2.VideoCapture(rtsp_url)
@@ -264,7 +245,6 @@ def monitor_rtsp_task(self, case_id: str, rtsp_url: str, reference_embedding: li
                 continue
             
             if frame_idx % frame_interval == 0:
-                # Resize for transmission efficiency
                 h, w = frame.shape[:2]
                 if w > 640:
                     ratio = 640 / w
@@ -289,56 +269,48 @@ def monitor_rtsp_task(self, case_id: str, rtsp_url: str, reference_embedding: li
                             bbox = match["bbox"]
                             timestamp_sec = frame_idx / fps
                             
-                            screenshot_path = _save_screenshot(
+                            screenshot_url = _upload_screenshot(
                                 frame, case_id, frame_idx, bbox
                             )
                             
                             match_id = str(uuid.uuid4())
-                            db.execute(
-                                """INSERT INTO matches 
-                                   (id, case_id, video_source, source_type, timestamp_seconds,
-                                    timestamp_display, frame_number, confidence_score,
-                                    bbox_x1, bbox_y1, bbox_x2, bbox_y2, screenshot_local,
-                                    camera_id)
-                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                                (match_id, case_id, rtsp_url, "rtsp",
-                                 timestamp_sec, _format_timestamp(timestamp_sec), frame_idx,
-                                 confidence, bbox[0], bbox[1], bbox[2], bbox[3],
-                                 screenshot_path, rtsp_url)
-                            )
+                            match_data = {
+                                "id": match_id,
+                                "case_id": case_id,
+                                "video_source": rtsp_url,
+                                "source_type": "rtsp",
+                                "timestamp_seconds": timestamp_sec,
+                                "timestamp_display": _format_timestamp(timestamp_sec),
+                                "frame_number": frame_idx,
+                                "confidence_score": confidence,
+                                "bbox_x1": bbox[0],
+                                "bbox_y1": bbox[1],
+                                "bbox_x2": bbox[2],
+                                "bbox_y2": bbox[3],
+                                "screenshot_cloud": screenshot_url,
+                                "camera_id": rtsp_url
+                            }
+                            supabase.table("matches").insert(match_data).execute()
                             
-                            # Update case match count
-                            db.execute(
-                                """UPDATE cases SET total_matches = total_matches + 1,
-                                   updated_at = datetime('now') WHERE id = ?""",
-                                (case_id,)
-                            )
-                            db.commit()
+                            current_matches = _fetch_case_matches_count(case_id)
+                            supabase.table("cases").update({
+                                "total_matches": current_matches + 1,
+                                "updated_at": datetime.utcnow().isoformat()
+                            }).eq("id", case_id).execute()
                 
                 except requests.exceptions.RequestException:
-                    pass  # Continue monitoring even if one frame fails
+                    pass 
             
             frame_idx += 1
         
         cap.release()
         
         if job_id:
-            db.execute(
-                """UPDATE jobs SET status = ?, completed_at = ? WHERE id = ?""",
-                ("completed", datetime.utcnow().isoformat(), job_id)
-            )
-            db.commit()
+            supabase.table("jobs").update({"status": "completed", "completed_at": datetime.utcnow().isoformat()}).eq("id", job_id).execute()
         
         return {"status": "completed", "case_id": case_id, "matches": matches_found}
         
     except Exception as e:
         if job_id:
-            db.execute(
-                "UPDATE jobs SET status = ?, error_message = ? WHERE id = ?",
-                ("failed", str(e), job_id)
-            )
-            db.commit()
+            supabase.table("jobs").update({"status": "failed", "error_message": str(e)}).eq("id", job_id).execute()
         raise
-        
-    finally:
-        db.close()

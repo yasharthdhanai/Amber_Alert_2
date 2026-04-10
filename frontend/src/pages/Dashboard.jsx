@@ -149,7 +149,7 @@ export default function Dashboard() {
               <div className="h-48 w-full relative overflow-hidden bg-slate-900 border-b border-white/5">
                 <div className="absolute inset-0 bg-gradient-to-t from-slate-900 to-transparent z-10 opacity-90" />
                 <img 
-                  src={getCasePhotoUrl(c.id)} 
+                  src={c.reference_photo || getCasePhotoUrl(c.id)} 
                   className="w-full h-full object-cover object-top group-hover:scale-105 transition-transform duration-700"
                   alt={c.child_name} 
                   onError={(e) => { e.target.src = "https://images.unsplash.com/photo-1543332143-4e8c27e3256f?w=400&q=80"; }} // Fallback
