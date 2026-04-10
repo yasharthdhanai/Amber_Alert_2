@@ -139,8 +139,8 @@ export default function CaseDetail() {
           <div className="flex flex-col md:flex-row md:items-center justify-between w-full">
             <div className="flex items-center space-x-3 mb-4 md:mb-0">
               <h1 className="text-4xl md:text-5xl font-bold tracking-tight text-white">{caseData.child_name}</h1>
-              <span className={`px-3 py-1 rounded-full text-xs font-bold uppercase tracking-widest border ${caseData.status === 'active' ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30' : 'bg-slate-500/20 text-slate-400 border-slate-500/30'}`}>
-                {caseData.status} Case
+              <span className={`px-3 py-1 rounded-full text-xs font-bold uppercase tracking-widest border ${(caseData.status || 'active') === 'active' ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30' : 'bg-slate-500/20 text-slate-400 border-slate-500/30'}`}>
+                {(caseData.status || 'active')} Case
               </span>
             </div>
           </div>

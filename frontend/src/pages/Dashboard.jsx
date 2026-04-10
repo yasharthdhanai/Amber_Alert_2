@@ -159,7 +159,7 @@ export default function Dashboard() {
                     <div className="flex items-center space-x-2 mb-1">
                       <span className="px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-500/20 border border-emerald-500/50 text-emerald-400 flex items-center">
                         <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse mr-1.5" />
-                        {c.status.toUpperCase()}
+                        {(c.status || 'active').toUpperCase()}
                       </span>
                       <span className="text-xs text-slate-300 font-medium">{c.case_number}</span>
                     </div>

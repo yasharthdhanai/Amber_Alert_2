@@ -6,8 +6,12 @@ import base64
 import uuid
 import time
 from datetime import datetime
+from dotenv import load_dotenv
 from .video_utils import get_video_rotation, extract_and_normalize_frame
 from .database import supabase
+
+# Load .env so Celery worker picks up ML_SERVICE_URL
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"), override=True)
 
 redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 ml_service_url = os.environ.get("ML_SERVICE_URL", "http://localhost:8050")
